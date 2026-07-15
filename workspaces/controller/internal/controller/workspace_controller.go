@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -91,6 +92,13 @@ const (
 	stateMsgRunning                        = "Workspace is running"
 	stateMsgTerminating                    = "Workspace is terminating"
 	stateMsgUnknown                        = "Workspace is in an unknown state"
+
+	// condition messages for the "healthy" (True) sub-states
+	// NOTE: these populate `condition.message`; they never surface as `status.stateMessage`,
+	//       which is only taken from the condition that determines a non-Running summary state
+	condMsgConfigResolved       = "Workspace config resolved"
+	condMsgResourcesProvisioned = "Workspace resources provisioned"
+	condMsgPodScheduled         = "Workspace Pod is scheduled"
 )
 
 // WorkspaceReconciler reconciles a Workspace object
@@ -146,8 +154,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err := r.Get(ctx, client.ObjectKey{Name: workspaceKindName}, workspaceKind); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.V(0).Info("Workspace references unknown WorkspaceKind")
-			return r.updateWorkspaceState(ctx, log, workspace,
-				kubefloworgv1beta1.WorkspaceStateError,
+			return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+				kubefloworgv1beta1.WorkspaceConditionConfigResolved,
+				kubefloworgv1beta1.WorkspaceConditionReasonWorkspaceKindNotFound,
 				fmt.Sprintf(stateMsgErrorUnknownWorkspaceKind, workspaceKindName),
 			)
 		}
@@ -179,8 +188,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	currentImageConfig, desiredImageConfig, imageConfigRedirectChain, err := getImageConfig(workspace, workspaceKind)
 	if err != nil {
 		log.V(0).Info("failed to get imageConfig for Workspace", "error", err.Error())
-		return r.updateWorkspaceState(ctx, log, workspace,
-			kubefloworgv1beta1.WorkspaceStateError,
+		return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+			kubefloworgv1beta1.WorkspaceConditionConfigResolved,
+			kubefloworgv1beta1.WorkspaceConditionReasonInvalidImageConfig,
 			fmt.Sprintf(stateMsgErrorInvalidImageConfig, err.Error()),
 		)
 	}
@@ -197,8 +207,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	currentPodConfig, desiredPodConfig, podConfigRedirectChain, err := getPodConfig(workspace, workspaceKind)
 	if err != nil {
 		log.V(0).Info("failed to get podConfig for Workspace", "error", err.Error())
-		return r.updateWorkspaceState(ctx, log, workspace,
-			kubefloworgv1beta1.WorkspaceStateError,
+		return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+			kubefloworgv1beta1.WorkspaceConditionConfigResolved,
+			kubefloworgv1beta1.WorkspaceConditionReasonInvalidPodConfig,
 			fmt.Sprintf(stateMsgErrorInvalidPodConfig, err.Error()),
 		)
 	}
@@ -211,6 +222,10 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		workspace.Status.PodTemplateOptions.PodConfig.RedirectChain = nil
 	}
 
+	// the WorkspaceKind and the selected imageConfig/podConfig options all resolved
+	setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionConfigResolved, metav1.ConditionTrue,
+		kubefloworgv1beta1.WorkspaceConditionReasonResolved, condMsgConfigResolved)
+
 	//
 	// TODO: in the future, we might want to use "pendingRestart" for other changes to WorkspaceKind that update the PodTemplate
 	//       like `podMetadata`, `probes`, `extraEnv`, or `containerSecurityContext`. But for now, changes to these fields
@@ -221,8 +236,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	statefulSet, err := generateStatefulSet(workspace, workspaceKind, currentImageConfig.Spec, currentPodConfig.Spec)
 	if err != nil {
 		log.V(0).Info("failed to generate StatefulSet for Workspace", "error", err.Error())
-		return r.updateWorkspaceState(ctx, log, workspace,
-			kubefloworgv1beta1.WorkspaceStateError,
+		return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+			kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned,
+			kubefloworgv1beta1.WorkspaceConditionReasonStatefulSetGenerationFailed,
 			fmt.Sprintf(stateMsgErrorGenFailureStatefulSet, err.Error()),
 		)
 	}
@@ -254,8 +270,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		statefulSetListString := strings.Join(statefulSetList, ", ")
 		log.Error(nil, "Workspace owns multiple StatefulSets", "statefulSets", statefulSetListString)
-		return r.updateWorkspaceState(ctx, log, workspace,
-			kubefloworgv1beta1.WorkspaceStateError,
+		return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+			kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned,
+			kubefloworgv1beta1.WorkspaceConditionReasonDuplicateResources,
 			fmt.Sprintf(stateMsgErrorMultipleStatefulSets, statefulSetListString),
 		)
 	case numSts == 0:
@@ -286,8 +303,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	service, err := generateService(workspace, currentImageConfig.Spec)
 	if err != nil {
 		log.V(0).Info("failed to generate Service for Workspace", "error", err.Error())
-		return r.updateWorkspaceState(ctx, log, workspace,
-			kubefloworgv1beta1.WorkspaceStateError,
+		return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+			kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned,
+			kubefloworgv1beta1.WorkspaceConditionReasonServiceGenerationFailed,
 			fmt.Sprintf(stateMsgErrorGenFailureService, err.Error()),
 		)
 	}
@@ -319,8 +337,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		serviceListString := strings.Join(serviceList, ", ")
 		log.Error(nil, "Workspace owns multiple Services", "services", serviceListString)
-		return r.updateWorkspaceState(ctx, log, workspace,
-			kubefloworgv1beta1.WorkspaceStateError,
+		return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+			kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned,
+			kubefloworgv1beta1.WorkspaceConditionReasonDuplicateResources,
 			fmt.Sprintf(stateMsgErrorMultipleServices, serviceListString),
 		)
 	case numServices == 0:
@@ -352,14 +371,16 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		// generate VirtualService
 		virtualsvc, err := r.generateVirtualService(workspace, workspaceKind, service, currentImageConfig.Spec)
 		if err != nil {
-			return r.updateWorkspaceState(ctx, log, workspace,
-				kubefloworgv1beta1.WorkspaceStateError,
+			return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+				kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned,
+				kubefloworgv1beta1.WorkspaceConditionReasonVirtualServiceGenerationFailed,
 				fmt.Sprintf(stateMsgErrorGenFailureVirtualService, err.Error()),
 			)
 		}
 		if err := ctrl.SetControllerReference(workspace, virtualsvc, r.Scheme); err != nil {
-			return r.updateWorkspaceState(ctx, log, workspace,
-				kubefloworgv1beta1.WorkspaceStateError,
+			return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+				kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned,
+				kubefloworgv1beta1.WorkspaceConditionReasonControllerReferenceFailed,
 				fmt.Sprintf(stateMsgErrorSetControllerReference, "VirtualService", err.Error()),
 			)
 		}
@@ -386,8 +407,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 			virtualServiceListString := strings.Join(virtualServiceList, ", ")
 			log.Error(nil, "Workspace owns multiple VirtualServices", "virtualServices", virtualServiceListString)
-			return r.updateWorkspaceState(ctx, log, workspace,
-				kubefloworgv1beta1.WorkspaceStateError,
+			return r.updateWorkspaceStatusFailure(ctx, log, workspace, &currentStatus,
+				kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned,
+				kubefloworgv1beta1.WorkspaceConditionReasonDuplicateResources,
 				fmt.Sprintf(stateMsgErrorMultipleVirtualServices, virtualServiceListString),
 			)
 		case numVirtualServices == 0:
@@ -413,6 +435,11 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			}
 		}
 	}
+
+	// all owned resources (StatefulSet, Service, and VirtualService when Istio is enabled)
+	// were generated, are singular, and are owned by this Workspace
+	setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned, metav1.ConditionTrue,
+		kubefloworgv1beta1.WorkspaceConditionReasonProvisioned, condMsgResourcesProvisioned)
 
 	// fetch Pod
 	// NOTE: the first StatefulSet Pod is always called "{statefulSetName}-0"
@@ -499,14 +526,93 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager, opts *controlle
 		Complete(r)
 }
 
-// updateWorkspaceState attempts to immediately update the Workspace status with the provided state and message
-func (r *WorkspaceReconciler) updateWorkspaceState(ctx context.Context, log logr.Logger, workspace *kubefloworgv1beta1.Workspace, state kubefloworgv1beta1.WorkspaceState, message string) (ctrl.Result, error) { //nolint:unparam
+// setWorkspaceCondition upserts a single condition into `status.conditions`.
+// Conditions are merged by `type` (listType=map), and `lastTransitionTime` is only
+// bumped when the `status` actually changes, matching the CRD's declared merge semantics.
+func setWorkspaceCondition(workspace *kubefloworgv1beta1.Workspace, conditionType kubefloworgv1beta1.WorkspaceConditionType, status metav1.ConditionStatus, reason, message string) {
+	apimeta.SetStatusCondition(&workspace.Status.Conditions, metav1.Condition{
+		Type:               string(conditionType),
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: workspace.Generation,
+	})
+}
+
+// deriveWorkspaceState computes the summary `state` enum and `stateMessage` from the
+// structured `status.conditions`, following the derivation order documented on the
+// WorkspaceConditionType constants (first matching rule wins). The `stateMessage` is
+// taken from the condition that determines the state.
+func deriveWorkspaceState(paused, terminating bool, conditions []metav1.Condition) (kubefloworgv1beta1.WorkspaceState, string) {
+	// rule 1: the Workspace is paused
+	if paused {
+		return kubefloworgv1beta1.WorkspaceStatePaused, stateMsgPaused
+	}
+
+	// rule 2: the Pod is terminating
+	if terminating {
+		return kubefloworgv1beta1.WorkspaceStateTerminating, stateMsgTerminating
+	}
+
+	configResolved := apimeta.FindStatusCondition(conditions, string(kubefloworgv1beta1.WorkspaceConditionConfigResolved))
+	resourcesProvisioned := apimeta.FindStatusCondition(conditions, string(kubefloworgv1beta1.WorkspaceConditionResourcesProvisioned))
+	podScheduled := apimeta.FindStatusCondition(conditions, string(kubefloworgv1beta1.WorkspaceConditionPodScheduled))
+	workspaceReady := apimeta.FindStatusCondition(conditions, string(kubefloworgv1beta1.WorkspaceConditionWorkspaceReady))
+
+	// rule 3: config or owned resources could not be resolved/provisioned
+	if configResolved != nil && configResolved.Status == metav1.ConditionFalse {
+		return kubefloworgv1beta1.WorkspaceStateError, configResolved.Message
+	}
+	if resourcesProvisioned != nil && resourcesProvisioned.Status == metav1.ConditionFalse {
+		return kubefloworgv1beta1.WorkspaceStateError, resourcesProvisioned.Message
+	}
+
+	// rule 4: the Pod could not be scheduled
+	if podScheduled != nil && podScheduled.Status == metav1.ConditionFalse {
+		return kubefloworgv1beta1.WorkspaceStateError, podScheduled.Message
+	}
+
+	// rules 5-7: Pod runtime readiness
+	if workspaceReady != nil {
+		switch workspaceReady.Status { //nolint:exhaustive
+		case metav1.ConditionFalse:
+			switch workspaceReady.Reason {
+			case kubefloworgv1beta1.WorkspaceConditionReasonCrashLoopBackOff,
+				kubefloworgv1beta1.WorkspaceConditionReasonImagePullBackOff,
+				kubefloworgv1beta1.WorkspaceConditionReasonPodWarningEvent,
+				kubefloworgv1beta1.WorkspaceConditionReasonStatefulSetWarningEvent:
+				// rule 5: the Pod (or its StatefulSet) hit a runtime error
+				return kubefloworgv1beta1.WorkspaceStateError, workspaceReady.Message
+			case kubefloworgv1beta1.WorkspaceConditionReasonPending:
+				// rule 6: the Pod is still starting up
+				return kubefloworgv1beta1.WorkspaceStatePending, workspaceReady.Message
+			}
+		case metav1.ConditionTrue:
+			// rule 7: the Pod is running and ready
+			return kubefloworgv1beta1.WorkspaceStateRunning, workspaceReady.Message
+		}
+	}
+
+	// rule 8: no rule matched
+	return kubefloworgv1beta1.WorkspaceStateUnknown, stateMsgUnknown
+}
+
+// updateWorkspaceStatusFailure sets a failing (False) condition, re-derives the summary
+// `state`/`stateMessage`, and immediately persists the status if it changed. It is used
+// by the early-return paths in Reconcile that bail before the full status is generated.
+func (r *WorkspaceReconciler) updateWorkspaceStatusFailure(ctx context.Context, log logr.Logger, workspace *kubefloworgv1beta1.Workspace, currentStatus *kubefloworgv1beta1.WorkspaceStatus, conditionType kubefloworgv1beta1.WorkspaceConditionType, reason, message string) (ctrl.Result, error) {
 	if workspace == nil {
 		return ctrl.Result{}, fmt.Errorf("provided Workspace was nil")
 	}
-	if workspace.Status.State != state || workspace.Status.StateMessage != message {
-		workspace.Status.State = state
-		workspace.Status.StateMessage = message
+
+	setWorkspaceCondition(workspace, conditionType, metav1.ConditionFalse, reason, message)
+
+	// NOTE: these early-return paths run before the Pod is fetched, so `terminating` is
+	//       never observable here; `paused` still takes precedence per the derivation rules
+	paused := ptr.Deref(workspace.Spec.Paused, false)
+	workspace.Status.State, workspace.Status.StateMessage = deriveWorkspaceState(paused, false, workspace.Status.Conditions)
+
+	if !equality.Semantic.DeepEqual(*currentStatus, workspace.Status) {
 		if err := r.Status().Update(ctx, workspace); err != nil {
 			if apierrors.IsConflict(err) {
 				log.V(2).Info("update conflict while updating Workspace status, will requeue")
@@ -1144,13 +1250,18 @@ func (r *WorkspaceReconciler) generateWorkspaceStatus(ctx context.Context, log l
 	// populate the pod information
 	status.PodTemplatePod = generateWorkspacePodStatus(pod)
 
-	// populate the workspace state and state message
-	workspaceState, workspaceStateMessage, result, err := r.generateWorkspaceState(ctx, log, workspacePaused, statefulSet, pod)
+	// populate the runtime sub-state conditions (PodScheduled, WorkspaceReady) from the Pod / StatefulSet
+	result, err := r.reconcileRuntimeConditions(ctx, log, workspace, statefulSet, pod)
 	if err != nil {
 		return status, ctrl.Result{}, err
 	}
-	status.State = workspaceState
-	status.StateMessage = workspaceStateMessage
+	// reconcileRuntimeConditions mutates workspace.Status.Conditions in place, so sync the
+	// updated slice into our working status before deriving the summary state
+	status.Conditions = workspace.Status.Conditions
+
+	// derive the summary state and message from the structured conditions
+	terminating := pod != nil && pod.GetDeletionTimestamp() != nil
+	status.State, status.StateMessage = deriveWorkspaceState(workspacePaused, terminating, status.Conditions)
 
 	return status, result, nil
 }
@@ -1191,20 +1302,13 @@ func generateWorkspacePodStatus(pod *corev1.Pod) kubefloworgv1beta1.WorkspacePod
 	return podStatus
 }
 
-// generateWorkspaceState gets current state and stateMessage for a Workspace
-func (r *WorkspaceReconciler) generateWorkspaceState(ctx context.Context, log logr.Logger, paused bool, statefulSet *appsv1.StatefulSet, pod *corev1.Pod) (kubefloworgv1beta1.WorkspaceState, string, ctrl.Result, error) { //nolint:gocyclo
-	state := kubefloworgv1beta1.WorkspaceStateUnknown
-	stateMessage := stateMsgUnknown
-
+// reconcileRuntimeConditions sets the runtime sub-state conditions (PodScheduled and
+// WorkspaceReady) on the Workspace from the current Pod and StatefulSet, and returns the
+// requeue result. The summary `state`/`stateMessage` are computed from these conditions by
+// deriveWorkspaceState; paused/terminating are handled there and so are not conditions here.
+func (r *WorkspaceReconciler) reconcileRuntimeConditions(ctx context.Context, log logr.Logger, workspace *kubefloworgv1beta1.Workspace, statefulSet *appsv1.StatefulSet, pod *corev1.Pod) (ctrl.Result, error) { //nolint:gocyclo
 	// cases where the Pod does not exist
 	if pod == nil {
-		// STATUS: Paused
-		if paused {
-			state = kubefloworgv1beta1.WorkspaceStatePaused
-			stateMessage = stateMsgPaused
-			return state, stateMessage, ctrl.Result{}, nil
-		}
-
 		// there might be StatefulSet events
 		statefulSetEvents := &corev1.EventList{}
 		listOpts := &client.ListOptions{
@@ -1213,7 +1317,7 @@ func (r *WorkspaceReconciler) generateWorkspaceState(ctx context.Context, log lo
 		}
 		if err := r.List(ctx, statefulSetEvents, listOpts); err != nil {
 			log.Error(err, "unable to list StatefulSet events")
-			return state, stateMessage, ctrl.Result{}, err
+			return ctrl.Result{}, err
 		}
 
 		// find the last StatefulSet warning event
@@ -1231,140 +1335,156 @@ func (r *WorkspaceReconciler) generateWorkspaceState(ctx context.Context, log lo
 			}
 		}
 
-		// STATUS: Error (StatefulSet warning event)
+		// WORKSPACE READY: False (StatefulSet warning event)
 		if lastStsWarningEvent != nil {
-			state = kubefloworgv1beta1.WorkspaceStateError
-			stateMessage = fmt.Sprintf(stateMsgErrorStatefulSetWarningEvent, lastStsWarningEvent.Message)
-			return state, stateMessage, ctrl.Result{}, nil
+			setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionWorkspaceReady, metav1.ConditionFalse,
+				kubefloworgv1beta1.WorkspaceConditionReasonStatefulSetWarningEvent,
+				fmt.Sprintf(stateMsgErrorStatefulSetWarningEvent, lastStsWarningEvent.Message))
+			return ctrl.Result{}, nil
+		}
+
+		// WORKSPACE READY: Unknown (Pod not yet created)
+		// NOTE: readiness cannot be observed until the Pod exists; a paused Workspace is still
+		//       reported as Paused by the summary-state derivation regardless of this condition
+		setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionWorkspaceReady, metav1.ConditionUnknown,
+			kubefloworgv1beta1.WorkspaceConditionReasonPending, stateMsgPending)
+		return ctrl.Result{}, nil
+	}
+
+	// STATUS: Terminating is handled by the summary-state derivation (via the Pod deletion
+	// timestamp); leave the runtime conditions as-is while the Pod is going away
+	if pod.GetDeletionTimestamp() != nil {
+		return ctrl.Result{}, nil
+	}
+
+	// get the pod phase
+	// https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-phase
+	podPhase := pod.Status.Phase
+
+	// get the pod conditions
+	// https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-conditions
+	var podScheduledCondition corev1.PodCondition
+	var podReadyCondition corev1.PodCondition
+	for _, condition := range pod.Status.Conditions {
+		switch condition.Type { //nolint:exhaustive
+		case corev1.PodScheduled:
+			podScheduledCondition = condition
+		case corev1.PodReady:
+			podReadyCondition = condition
 		}
 	}
 
-	// cases where the Pod exists
-	if pod != nil {
-		// STATUS: Terminating
-		if pod.GetDeletionTimestamp() != nil {
-			state = kubefloworgv1beta1.WorkspaceStateTerminating
-			stateMessage = stateMsgTerminating
-			return state, stateMessage, ctrl.Result{}, nil
+	// unpack the pod conditions
+	podScheduled := podScheduledCondition.Status == corev1.ConditionTrue
+	podReady := podReadyCondition.Status == corev1.ConditionTrue
+
+	// POD SCHEDULED: derive from the Pod's own scheduling condition
+	if podScheduled {
+		setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionPodScheduled, metav1.ConditionTrue,
+			kubefloworgv1beta1.WorkspaceConditionReasonScheduled, condMsgPodScheduled)
+	} else {
+		// POD SCHEDULED: False (scheduling errors) short-circuit, mirroring the prior behavior
+		switch podScheduledCondition.Reason {
+		case corev1.PodReasonUnschedulable:
+			setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionPodScheduled, metav1.ConditionFalse,
+				kubefloworgv1beta1.WorkspaceConditionReasonUnschedulable,
+				fmt.Sprintf(stateMsgErrorPodUnschedulable, podScheduledCondition.Message))
+			return ctrl.Result{}, nil
+		case corev1.PodReasonSchedulingGated:
+			setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionPodScheduled, metav1.ConditionFalse,
+				kubefloworgv1beta1.WorkspaceConditionReasonSchedulingGated,
+				fmt.Sprintf(stateMsgErrorPodSchedulingGate, podScheduledCondition.Message))
+			return ctrl.Result{}, nil
+		case corev1.PodReasonSchedulerError:
+			setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionPodScheduled, metav1.ConditionFalse,
+				kubefloworgv1beta1.WorkspaceConditionReasonSchedulerError,
+				fmt.Sprintf(stateMsgErrorPodSchedulerError, podScheduledCondition.Message))
+			return ctrl.Result{}, nil
 		}
+		// other (transient) unscheduled reasons: leave PodScheduled unset and let the readiness
+		// checks below classify the Pod (typically as Pending)
+	}
 
-		// get the pod phase
-		// https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-phase
-		podPhase := pod.Status.Phase
+	// WORKSPACE READY: True (Pod is running and ready)
+	if podPhase == corev1.PodRunning && podReady {
+		setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionWorkspaceReady, metav1.ConditionTrue,
+			kubefloworgv1beta1.WorkspaceConditionReasonRunning, stateMsgRunning)
+		return ctrl.Result{}, nil
+	}
 
-		// get the pod conditions
-		// https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-conditions
-		var podScheduledCondition corev1.PodCondition
-		var podReadyCondition corev1.PodCondition
-		for _, condition := range pod.Status.Conditions {
-			switch condition.Type { //nolint:exhaustive
-			case corev1.PodScheduled:
-				podScheduledCondition = condition
-			case corev1.PodReady:
-				podReadyCondition = condition
-			}
+	// get container status
+	// https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-states
+	var containerStatus corev1.ContainerStatus
+	for _, container := range pod.Status.ContainerStatuses {
+		if container.Name == workspacePodTemplateContainerName {
+			containerStatus = container
+			break
 		}
+	}
 
-		// unpack the pod conditions
-		podScheduled := podScheduledCondition.Status == corev1.ConditionTrue
-		podReady := podReadyCondition.Status == corev1.ConditionTrue
+	// get the container state
+	containerState := containerStatus.State
 
-		// STATUS: Error (pod conditions)
-		if !podScheduled {
-			switch podScheduledCondition.Reason {
-			case corev1.PodReasonUnschedulable:
-				state = kubefloworgv1beta1.WorkspaceStateError
-				stateMessage = fmt.Sprintf(stateMsgErrorPodUnschedulable, podScheduledCondition.Message)
-				return state, stateMessage, ctrl.Result{}, nil
-			case corev1.PodReasonSchedulingGated:
-				state = kubefloworgv1beta1.WorkspaceStateError
-				stateMessage = fmt.Sprintf(stateMsgErrorPodSchedulingGate, podScheduledCondition.Message)
-				return state, stateMessage, ctrl.Result{}, nil
-			case corev1.PodReasonSchedulerError:
-				state = kubefloworgv1beta1.WorkspaceStateError
-				stateMessage = fmt.Sprintf(stateMsgErrorPodSchedulerError, podScheduledCondition.Message)
-				return state, stateMessage, ctrl.Result{}, nil
-			}
+	// WORKSPACE READY: False (container state)
+	if containerState.Waiting != nil {
+		if containerState.Waiting.Reason == "CrashLoopBackOff" {
+			setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionWorkspaceReady, metav1.ConditionFalse,
+				kubefloworgv1beta1.WorkspaceConditionReasonCrashLoopBackOff, stateMsgErrorContainerCrashLoopBackOff)
+			return ctrl.Result{}, nil
 		}
-
-		// STATUS: Running
-		if podPhase == corev1.PodRunning && podReady {
-			state = kubefloworgv1beta1.WorkspaceStateRunning
-			stateMessage = stateMsgRunning
-			return state, stateMessage, ctrl.Result{}, nil
+		if containerState.Waiting.Reason == "ImagePullBackOff" {
+			setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionWorkspaceReady, metav1.ConditionFalse,
+				kubefloworgv1beta1.WorkspaceConditionReasonImagePullBackOff, stateMsgErrorContainerImagePullBackOff)
+			return ctrl.Result{}, nil
 		}
+	}
 
-		// get container status
-		// https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-states
-		var containerStatus corev1.ContainerStatus
-		for _, container := range pod.Status.ContainerStatuses {
-			if container.Name == workspacePodTemplateContainerName {
-				containerStatus = container
-				break
-			}
-		}
+	// there might be Pod events (e.g. for missing volumes)
+	podEvents := &corev1.EventList{}
+	listOpts := &client.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector(helper.IndexEventInvolvedObjectUidField, string(pod.UID)),
+		Namespace:     pod.Namespace,
+	}
+	if err := r.List(ctx, podEvents, listOpts); err != nil {
+		log.Error(err, "unable to list Pod events")
+		return ctrl.Result{}, err
+	}
 
-		// get the container state
-		containerState := containerStatus.State
-
-		// STATUS: Error (container state)
-		if containerState.Waiting != nil {
-			if containerState.Waiting.Reason == "CrashLoopBackOff" {
-				state = kubefloworgv1beta1.WorkspaceStateError
-				stateMessage = stateMsgErrorContainerCrashLoopBackOff
-				return state, stateMessage, ctrl.Result{}, nil
-			}
-			if containerState.Waiting.Reason == "ImagePullBackOff" {
-				state = kubefloworgv1beta1.WorkspaceStateError
-				stateMessage = stateMsgErrorContainerImagePullBackOff
-				return state, stateMessage, ctrl.Result{}, nil
-			}
-		}
-
-		// there might be Pod events (e.g. for missing volumes)
-		podEvents := &corev1.EventList{}
-		listOpts := &client.ListOptions{
-			FieldSelector: fields.OneTermEqualSelector(helper.IndexEventInvolvedObjectUidField, string(pod.UID)),
-			Namespace:     pod.Namespace,
-		}
-		if err := r.List(ctx, podEvents, listOpts); err != nil {
-			log.Error(err, "unable to list Pod events")
-			return state, stateMessage, ctrl.Result{}, err
-		}
-
-		// find the last Pod warning event
-		var lastPodWarningEvent *corev1.Event
-		if len(podEvents.Items) > 0 {
-			for i, event := range podEvents.Items {
-				if event.Type == corev1.EventTypeWarning {
-					//
-					// TODO: ensure this actually works when there are multiple Warning events for this object
-					//
-					if lastPodWarningEvent == nil || lastPodWarningEvent.LastTimestamp.Time.Before(event.LastTimestamp.Time) {
-						lastPodWarningEvent = &podEvents.Items[i]
-					}
+	// find the last Pod warning event
+	var lastPodWarningEvent *corev1.Event
+	if len(podEvents.Items) > 0 {
+		for i, event := range podEvents.Items {
+			if event.Type == corev1.EventTypeWarning {
+				//
+				// TODO: ensure this actually works when there are multiple Warning events for this object
+				//
+				if lastPodWarningEvent == nil || lastPodWarningEvent.LastTimestamp.Time.Before(event.LastTimestamp.Time) {
+					lastPodWarningEvent = &podEvents.Items[i]
 				}
 			}
 		}
-
-		// STATUS: Error (Pod warning event)
-		if lastPodWarningEvent != nil {
-			state = kubefloworgv1beta1.WorkspaceStateError
-			stateMessage = fmt.Sprintf(stateMsgErrorPodWarningEvent, lastPodWarningEvent.Message)
-			return state, stateMessage, ctrl.Result{}, nil
-		}
-
-		// STATUS: Pending
-		// NOTE: when the Pod is pending and does not have any warning Events, we requeue after a short delay.
-		//       typically, if a Pod is stuck in Pending, the only indication of why is in the Events,
-		//       but they may not exist at the time of the first reconcile.
-		if podPhase == corev1.PodPending {
-			state = kubefloworgv1beta1.WorkspaceStatePending
-			stateMessage = stateMsgPending
-			return state, stateMessage, ctrl.Result{RequeueAfter: 15 * time.Second}, nil
-		}
 	}
 
-	// STATUS: Unknown
-	return state, stateMessage, ctrl.Result{}, nil
+	// WORKSPACE READY: False (Pod warning event)
+	if lastPodWarningEvent != nil {
+		setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionWorkspaceReady, metav1.ConditionFalse,
+			kubefloworgv1beta1.WorkspaceConditionReasonPodWarningEvent,
+			fmt.Sprintf(stateMsgErrorPodWarningEvent, lastPodWarningEvent.Message))
+		return ctrl.Result{}, nil
+	}
+
+	// WORKSPACE READY: False (Pending)
+	// NOTE: when the Pod is pending and does not have any warning Events, we requeue after a short delay.
+	//       typically, if a Pod is stuck in Pending, the only indication of why is in the Events,
+	//       but they may not exist at the time of the first reconcile.
+	if podPhase == corev1.PodPending {
+		setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionWorkspaceReady, metav1.ConditionFalse,
+			kubefloworgv1beta1.WorkspaceConditionReasonPending, stateMsgPending)
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	// WORKSPACE READY: Unknown (no rule matched, e.g. an unexpected Pod phase)
+	setWorkspaceCondition(workspace, kubefloworgv1beta1.WorkspaceConditionWorkspaceReady, metav1.ConditionUnknown,
+		kubefloworgv1beta1.WorkspaceConditionReasonPending, stateMsgUnknown)
+	return ctrl.Result{}, nil
 }
